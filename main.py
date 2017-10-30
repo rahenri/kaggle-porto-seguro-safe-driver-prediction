@@ -11,6 +11,7 @@ import lightgbm as lgb
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import KFold
+from numba import jit
 
 SEED = 1234
 
@@ -58,6 +59,7 @@ class Params:
             train_set=train_set,
             num_boost_round=self.num_rounds,
             verbose_eval=10,
+            feval=gini_xgb,
         )
 
         if evals:
@@ -66,6 +68,29 @@ class Params:
             args['early_stopping_rounds'] = early_stopping_rounds
 
         return args
+
+
+@jit
+def eval_gini(y_true, y_prob):
+    y_true = np.asarray(y_true)
+    y_true = y_true[np.argsort(y_prob)]
+    ntrue = 0
+    gini = 0
+    delta = 0
+    n = len(y_true)
+    for i in range(n-1, -1, -1):
+        y_i = y_true[i]
+        ntrue += y_i
+        gini += y_i * delta
+        delta += 1 - y_i
+    gini = 1 - 2 * gini / (ntrue * (n - ntrue))
+    return gini
+
+
+def gini_xgb(preds, dtrain):
+    labels = dtrain.get_label()
+    gini_score = eval_gini(labels, preds)
+    return ('gini', gini_score, True)
 
 
 def CostFunction(y_pred, y_true):
@@ -100,7 +125,7 @@ def CrossValidateLG(X, target, variables, folds=3, params=Params()):
 
     args = params.MakeArgs(lgb_train)
     result = lgb.cv(nfold=folds,
-                    early_stopping_rounds=5,
+                    early_stopping_rounds=50,
                     **args)
     rounds = len(result)
     test_mean = result['binary_logloss-mean'][-1]
@@ -115,16 +140,15 @@ def RunModel(
     if target in test.columns:
         test_y = test[target]
 
-    return TrainLGB(train[variables], train[target], test[variables], test_y)
+    return TrainLGB(train[variables], train[target], test[variables], test_y, params)
 
 
 @log_duration
-def TrainLGB(train_X, train_y, test_X, test_y, params=Params()):
+def TrainLGB(train_X, train_y, test_X, test_y, params):
     lgb_train = lgb.Dataset(train_X, train_y)
-    lgb_eval = lgb.Dataset(test_X, test_y, reference=lgb_train)
 
     # specify your configurations as a dict
-    args = params.MakeArgs(lgb_train, evals=lgb_eval)
+    args = params.MakeArgs(lgb_train, evals=lgb_train)
     print('Start training...')
     # train
     gbm = lgb.train(**args)
@@ -410,10 +434,10 @@ def product_params(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-            '--rounds', default=200, type=int,
+            '--rounds', default=1400, type=int,
             help='Max number of boosting rounds')
     parser.add_argument(
-            '--eta', default=0.05, type=float, help='Learning rate')
+            '--eta', default=0.01, type=float, help='Learning rate')
     parser.add_argument(
             '--max_depth', default=0, type=int, help='Max tree depth')
     parser.add_argument(
