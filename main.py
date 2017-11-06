@@ -11,9 +11,10 @@ import lightgbm as lgb
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import KFold
+from sklearn.preprocessing import LabelEncoder
 from numba import jit
 
-SEED = 1234
+SEED = 265359275
 
 
 def log_duration(func):
@@ -26,32 +27,49 @@ def log_duration(func):
     return wrapper
 
 
+def merge_dicts(d1, d2):
+    for k, v in d2.items():
+        if k not in d1:
+            d1[k] = v
+        else:
+            d1[k] += v
+
+
 class Params:
     def __init__(
-            self, num_rounds=100, eta=0.3, max_depth=4, min_child_weight=1,
-            subsample=0.7, colsample=0.7, reg_lambda=1, num_leaves=31):
+            self, num_rounds=100, eta=0.3, min_child_weight=1,
+            subsample=0.7, colsample=0.7, num_leaves=31,
+            lambda_l1=0, lambda_l2=0, scale_pos_weight=1,
+            min_split_gain=1):
         self.num_rounds = num_rounds
         self.eta = eta
-        self.max_depth = max_depth
         self.min_child_weight = min_child_weight
         self.subsample = subsample
         self.colsample = colsample
-        self.reg_lambda = reg_lambda
         self.num_leaves = num_leaves
+        self.lambda_l1 = lambda_l1
+        self.lambda_l2 = lambda_l2
+        self.scale_pos_weight = scale_pos_weight
+        self.min_split_gain = min_split_gain
 
     def MakeArgs(self, train_set, evals=None, early_stopping_rounds=None):
         params = {
             'task': 'train',
             'boosting_type': 'gbdt',
             'objective': 'binary',
-            'metric': 'binary_logloss',
+            'metric': 'auc',
             'learning_rate': self.eta,
             'feature_fraction': self.colsample,
             'bagging_fraction': self.subsample,
-            'bagging_freq': 5,
+            'bagging_freq': 1,
             'num_leaves': self.num_leaves,
             'verbose': 0,
-            'max_depth': self.max_depth,
+            'seed': SEED,
+            'lambda_l1': self.lambda_l1,
+            'lambda_l2': self.lambda_l2,
+            'min_child_weight': self.min_child_weight,
+            'scale_pos_weight': self.scale_pos_weight,
+            'min_split_gain': self.min_split_gain,
         }
 
         args = dict(
@@ -61,6 +79,8 @@ class Params:
             verbose_eval=10,
             feval=gini_xgb,
         )
+
+        print(args)
 
         if evals:
             args['valid_sets'] = evals
@@ -93,30 +113,43 @@ def gini_xgb(preds, dtrain):
     return ('gini', gini_score, True)
 
 
-def CostFunction(y_pred, y_true):
-    raise RuntimeError('Not implemented')
+def CostFunction(y_true, y_pred):
+    return eval_gini(y_true, y_pred)
 
 
-def CrossValidate(X, target, variables, folds=3, params=Params()):
+def CrossValidate(train, test, target, variables, folds=5, params=Params()):
     loss = []
-    preds = []
+    importance = {}
 
     select = KFold(folds, shuffle=True, random_state=SEED)
-    for train_index, test_index in select.split(X, X[target]):
-        train, test = X.iloc[train_index].copy(), X.iloc[test_index].copy()
+    test_preds = np.zeros(len(test))
+    train_preds = np.zeros(len(train))
+    sub_test = test
+    for train_index, test_index in select.split(train, train[target]):
+        sub_train = train.iloc[train_index].copy()
+        sub_val = train.iloc[test_index].copy()
 
-        pred, imp, train_score, _ = RunModel(
-                train, test, variables, target,
+        sub_features = []
+        sub_train, sub_test, sub_val, sub_features = gen_specialized_features(
+                sub_train, test, sub_val, target)
+        sub_features = variables + sub_features
+
+        predictor, imp = RunModel(
+                sub_train, sub_val, sub_features, target,
                 early_stopping=True, params=params)
+        merge_dicts(importance, imp)
 
-        loss.append(CostFunction(test[target], pred))
-        test.loc[:, target] = pred
-        preds.append(test)
-        logging.info(
-                'Partial CV: %f Train Score: %f',
-                np.mean(loss), train_score)
-    pred = pd.concat(preds)
-    return np.mean(loss), pred
+        val_pred = predictor(sub_val)
+        cv = CostFunction(sub_val[target], val_pred)
+        loss.append(cv)
+        train_preds[test_index] = val_pred
+
+        test_pred = predictor(sub_test)
+        test_preds += test_pred
+
+        logging.info('Fold CV: %f, Partial CV: %f', cv, np.mean(loss))
+    test_preds /= folds
+    return np.mean(loss), test_preds, importance
 
 
 @log_duration
@@ -128,7 +161,7 @@ def CrossValidateLG(X, target, variables, folds=3, params=Params()):
                     early_stopping_rounds=50,
                     **args)
     rounds = len(result)
-    test_mean = result['binary_logloss-mean'][-1]
+    test_mean = result['gini-mean'][-1]
     return test_mean, rounds
 
 
@@ -140,24 +173,39 @@ def RunModel(
     if target in test.columns:
         test_y = test[target]
 
-    return TrainLGB(train[variables], train[target], test[variables], test_y, params)
+    predictor, imp = TrainLGB(
+            train[variables], train[target], test[variables],
+            test_y, params, early_stopping=early_stopping)
+
+    def predictor2(X):
+        return predictor(X[variables])
+
+    return predictor2, imp
 
 
 @log_duration
-def TrainLGB(train_X, train_y, test_X, test_y, params):
+def TrainLGB(train_X, train_y, test_X, test_y, params, early_stopping=False):
     lgb_train = lgb.Dataset(train_X, train_y)
+    evals = None
+    if test_y is not None:
+        evals = lgb.Dataset(test_X, test_y)
 
+    early_stopping_rounds = None
+    if early_stopping:
+        early_stopping_rounds = 50
     # specify your configurations as a dict
-    args = params.MakeArgs(lgb_train, evals=lgb_train)
-    print('Start training...')
+    args = params.MakeArgs(
+            lgb_train, evals=evals,
+            early_stopping_rounds=early_stopping_rounds)
     # train
     gbm = lgb.train(**args)
 
-    y_pred = gbm.predict(test_X, num_iteration=gbm.best_iteration)
+    def predictor(X):
+        return gbm.predict(X, num_iteration=gbm.best_iteration)
 
     imp = dict(zip(gbm.feature_name(), gbm.feature_importance()))
 
-    return y_pred, imp, 0, 0
+    return predictor, imp
 
 
 def haversine_array(lat1, lng1, lat2, lng2):
@@ -180,6 +228,9 @@ def dummy_manhattan_distance(lat1, lng1, lat2, lng2):
 
 @log_duration
 def gen_features(df):
+    categorical = list(name for name in df.columns if name.endswith('_cat'))
+    for cat in categorical:
+        df[cat] += 1
     return df
 
 
@@ -248,11 +299,11 @@ def gen_count_feature(column_name, train, test):
 
 
 @log_duration
-def gen_mean_feature_for_target(column_name, train, test, target):
+def gen_mean_feature_for_target(column_name, train, test, val, target):
     df = pd.DataFrame(
             {column_name: train[column_name], 'target': train[target]})
     grouped = df.groupby(column_name)['target'].agg(['count', 'mean'])
-    grouped = grouped[grouped['count'] > 50]
+    grouped = grouped[grouped['count'] > 200]
 
     output_name = '{}_mean_{}'.format(column_name, target)
 
@@ -262,7 +313,10 @@ def gen_mean_feature_for_target(column_name, train, test, target):
     tmp = test.join(grouped, on=column_name).fillna(-1)
     test.loc[:, output_name] = tmp['mean']
 
-    return train, test
+    tmp = val.join(grouped, on=column_name).fillna(-1)
+    val.loc[:, output_name] = tmp['mean']
+
+    return train, test, val, output_name
 
 
 @log_duration
@@ -322,41 +376,43 @@ def encode_adjusted_mean(train_df, test_df, variable, target, r_k=0.01):
     return train_df, test_df
 
 
-def compute_hcc(train_df, test_df, variable, target, prior_prob):
+def compute_hcc(
+        train_df, test_df, val_df, variable,
+        target, min_samples_leaf=1, smoothing=1):
+    prior_prob = train_df[target].mean()
+
     hcc_name = "_".join(['hcc', variable, target])
 
     grouped = train_df.groupby(variable)[target].agg(["size", "mean"])
-    grouped[hcc_name] = grouped["mean"]
 
-    return test_df[[variable]].join(
-            grouped, on=variable)[hcc_name].fillna(prior_prob)
+    smoothing = 1/(1+np.exp(-(grouped["size"]-min_samples_leaf)/smoothing))
+
+    grouped[hcc_name] = (
+            prior_prob * (1 - smoothing) +
+            grouped["mean"] * smoothing)
+
+    grouped = grouped[[hcc_name]]
+
+    assert variable in train_df.columns
+    assert variable in test_df.columns
+    assert variable in val_df.columns
+
+    train_df = train_df.join(grouped, on=variable)
+    test_df = test_df.join(grouped, on=variable)
+    val_df = val_df.join(grouped, on=variable)
+
+    return train_df, test_df, val_df, hcc_name
 
 
 @log_duration
-def hcc_encode(train_df, test_df, variable, target, r_k=0.01):
+def hcc_encode(train_df, test_df, val_df, variable, target):
     """
     See "A Preprocessing Scheme for High-Cardinality Categorical Attributes in
     Classification and Prediction Problems" by Daniele Micci-Barreca
     """
-    prior_prob = train_df[target].mean()
-
-    df = train_df[[variable, target]].copy()
-
-    test_df = test_df.join(compute_hcc(
-        df, test_df, variable, target, prior_prob))
-
-    select = StratifiedKFold(5)
-    acc = []
-    for train_index, test_index in select.split(train_df, train_df[target]):
-        train2 = df.iloc[train_index].copy()
-        test2 = df.iloc[test_index].copy()
-        acc.append(compute_hcc(train2, test2, variable, target, prior_prob))
-
-    acc = pd.concat(acc)
-    train_df = train_df.join(acc * np.random.uniform(
-        1 - r_k, 1 + r_k, len(acc)))
-
-    return train_df, test_df
+    return compute_hcc(
+            train_df, test_df, val_df, variable, target,
+            min_samples_leaf=200, smoothing=10)
 
 
 @log_duration
@@ -394,21 +450,54 @@ def single_out(train_df, test_df, variable):
 
 
 @log_duration
-def gen_specialized_features(train, test):
+def gen_specialized_features(train, test, val, target):
     features = []
-    return train, test, features
+
+    categorical = list(name for name in train.columns if name.endswith('_cat'))
+    for cat in categorical:
+        train, test, val, feature = hcc_encode(
+                train, test, val, cat, target)
+        features.append(feature)
+
+    return train, test, val, features
+
+@log_duration
+def preCVFeatures(train, test):
+    combs = [
+        ('ps_reg_01', 'ps_car_02_cat'),  
+        ('ps_reg_01', 'ps_car_04_cat'),
+    ]
+
+    features = []
+
+    for n_c, (f1, f2) in enumerate(combs):
+        name1 = f1 + "_plus_" + f2
+        print('current feature %60s %4d in %5.1f'
+              % (name1, n_c + 1, (time.time() - start) / 60), end='')
+        print('\r' * 75, end='')
+        train_df[name1] = train_df[f1].apply(lambda x: str(x)) + "_" + train_df[f2].apply(lambda x: str(x))
+        test_df[name1] = test_df[f1].apply(lambda x: str(x)) + "_" + test_df[f2].apply(lambda x: str(x))
+        # Label Encode
+        lbl = LabelEncoder()
+        lbl.fit(list(train_df[name1].values) + list(test_df[name1].values))
+        train_df[name1] = lbl.transform(list(train_df[name1].values))
+        test_df[name1] = lbl.transform(list(test_df[name1].values))
+
+        features.append(name1)
+
+    return traind_df, test_df, features
 
 
 @log_duration
 def load_train_data():
-    df = pd.read_csv('train.csv')
+    df = pd.read_csv('train.csv.gz')
     print(df.describe())
     return df
 
 
 @log_duration
 def load_test_data():
-    df = pd.read_csv('test.csv')
+    df = pd.read_csv('test.csv.gz')
     print(df.describe())
     return df
 
@@ -434,16 +523,14 @@ def product_params(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-            '--rounds', default=1400, type=int,
+            '--rounds', default=2000, type=int,
             help='Max number of boosting rounds')
     parser.add_argument(
-            '--eta', default=0.01, type=float, help='Learning rate')
-    parser.add_argument(
-            '--max_depth', default=0, type=int, help='Max tree depth')
+            '--eta', default=0.07, type=float, help='Learning rate')
     parser.add_argument(
             '--num_leaves', default=31, type=int, help='Max tree leaves')
     parser.add_argument(
-            '--full', default=False, action='store_true',
+            '--full', default=True, action='store_true',
             help='Whether to do full train and evaluate test')
     parser.add_argument(
             '--search', default=False, action='store_true',
@@ -455,8 +542,11 @@ def main():
             '--no-cv', dest='cv', action='store_false', help='Do run CV')
     parser.add_argument('--colsample', default=0.8, type=float)
     parser.add_argument('--subsample', default=0.8, type=float)
-    parser.add_argument('--reg_lambda', default=10, type=float)
-    parser.add_argument('--min_child_weight', default=2, type=float)
+    parser.add_argument('--min_child_weight', default=6, type=float)
+    parser.add_argument('--lambda-l1', default=8, type=float)
+    parser.add_argument('--lambda-l2', default=1, type=float)
+    parser.add_argument('--scale-pos-weight', default=1.6, type=float)
+    parser.add_argument('--min-split-gain', default=0.1, type=float)
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -530,20 +620,18 @@ def main():
       'ps_calc_20_bin',
     ]
 
-    train, test, variables2 = gen_specialized_features(train, test)
-    feats.extend(variables2)
-
     TARGET = 'target'
     ID_COLUMN = 'id'
+
+    train, test, f = preCVFeatures(train, test)
+    feats.extend(f)
 
     if args.search:
         params_space = dict(
             # eta=[0.3, 0.15, 0.8, 0.4, 0.2, 0.1, 0.05],
-            max_depth=[10, 12, 16],
             min_child_weight=[1, 2, 4, 7, 10],
             subsample=[0.5, 0.7, 0.9],
             colsample=[0.3, 0.5, 0.7, 0.9],
-            reg_lambda=[4, 8, 10],
             eta=[0.04],
         )
 
@@ -572,37 +660,29 @@ def main():
 
     params = Params(
             num_rounds=args.rounds, eta=args.eta,
-            max_depth=args.max_depth, min_child_weight=args.min_child_weight,
             subsample=args.subsample, colsample=args.colsample,
-            reg_lambda=args.reg_lambda,
-            num_leaves=args.num_leaves)
-
-    if args.cv:
-        logging.info('Cross validating...')
-        score, cross_pred = CrossValidateLG(
-                train, TARGET, feats, params=params)
-        # pred.to_csv(
-        #    'train_m1.csv.gz', columns=[ID_COLUMN] + [TARGET],
-        #    index=False, compression='gzip')
-        logging.info('CV loss: %f', score)
-        # logging.info('CV rounds: %d', rounds)
+            lambda_l1=args.lambda_l1,
+            lambda_l2=args.lambda_l2,
+            num_leaves=args.num_leaves,
+            min_child_weight=args.min_child_weight,
+            scale_pos_weight=args.scale_pos_weight,
+            min_split_gain=args.min_split_gain)
 
     if args.full:
         logging.info('Training...')
-        pred, imp, train_score, _ = RunModel(
-                train, test, feats, TARGET, params=params)
+        loss, test_pred, imp = CrossValidate(
+                train, test, TARGET, feats, params=params)
 
-        logging.info('Train Score: %f', train_score)
         for f, w in sorted(imp.items(), key=lambda x: x[1]):
             logging.info('%s %d', f, w)
 
-        logging.info('Prediction mean: %f', pred.mean())
-        logging.info('Prediction log mean: %f', np.log(pred+1).mean())
+        logging.info('Prediction mean: %f', test_pred.mean())
 
         logging.info('Train mean: %f', train[TARGET].mean())
-        logging.info('Train log mean: %f', np.log(train[TARGET]+1).mean())
 
-        test[TARGET] = pred
+        logging.info('CV Score: %f', loss)
+
+        test[TARGET] = test_pred
 
         test = test.sort_values(ID_COLUMN)
 
