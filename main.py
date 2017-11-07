@@ -9,12 +9,14 @@ import argparse
 import lightgbm as lgb
 
 from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.model_selection import StratifiedKFold
+# from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
 from numba import jit
 
 SEED = 265359275
+
+FOLDS = 5
 
 
 def log_duration(func):
@@ -35,7 +37,15 @@ def merge_dicts(d1, d2):
             d1[k] += v
 
 
-class Params:
+class LGBMFactory:
+    def __init__(self, **args):
+        self.args = args
+
+    def __call__(self):
+        return LGBM(**self.args)
+
+
+class LGBM:
     def __init__(
             self, num_rounds=100, eta=0.3, min_child_weight=1,
             subsample=0.7, colsample=0.7, num_leaves=31,
@@ -52,7 +62,7 @@ class Params:
         self.scale_pos_weight = scale_pos_weight
         self.min_split_gain = min_split_gain
 
-    def MakeArgs(self, train_set, evals=None, early_stopping_rounds=None):
+    def _MakeArgs(self, train_set, evals=None, early_stopping_rounds=None):
         params = {
             'task': 'train',
             'boosting_type': 'gbdt',
@@ -87,6 +97,25 @@ class Params:
 
         return args
 
+    def predict(self, X):
+        return self.gbm.predict(X, num_iteration=self.gbm.best_iteration)
+
+    @log_duration
+    def fit(self, train_X, train_y, test_X, test_y):
+        lgb_train = lgb.Dataset(train_X, train_y)
+        evals = None
+        if test_y is not None:
+            evals = lgb.Dataset(test_X, test_y)
+
+        # specify your configurations as a dict
+        args = self._MakeArgs(
+                lgb_train, evals=evals,
+                early_stopping_rounds=50)
+        # train
+        self.gbm = lgb.train(**args)
+
+        self.imp = dict(zip(self.gbm.feature_name(), self.gbm.feature_importance()))
+
 
 @jit
 def eval_gini(y_true, y_prob):
@@ -115,11 +144,11 @@ def CostFunction(y_true, y_pred):
     return eval_gini(y_true, y_pred)
 
 
-def CrossValidate(train, test, target, variables, folds=5, params=Params()):
+def CrossValidate(train, test, target, variables, model_factory):
     loss = []
     importance = {}
 
-    select = KFold(folds, shuffle=True, random_state=SEED)
+    select = KFold(FOLDS, shuffle=True, random_state=SEED)
     test_preds = np.zeros(len(test))
     train_preds = np.zeros(len(train))
     sub_test = test
@@ -132,96 +161,24 @@ def CrossValidate(train, test, target, variables, folds=5, params=Params()):
                 sub_train, test, sub_val, target)
         sub_features = variables + sub_features
 
-        predictor, imp = RunModel(
-                sub_train, sub_val, sub_features, target,
-                early_stopping=True, params=params)
-        merge_dicts(importance, imp)
+        model = model_factory()
+        model.fit(
+                sub_train[sub_features], sub_train[target],
+                sub_val[sub_features], sub_val[target])
 
-        val_pred = predictor(sub_val)
+        merge_dicts(importance, model.imp)
+
+        val_pred = model.predict(sub_val[sub_features])
         cv = CostFunction(np.array(sub_val[target]), np.array(val_pred))
         loss.append(cv)
         train_preds[test_index] = val_pred
 
-        test_pred = predictor(sub_test)
+        test_pred = model.predict(sub_test[sub_features])
         test_preds += test_pred
 
         logging.info('Fold CV: %f, Running CV mean: %f', cv, np.mean(loss))
-    test_preds /= folds
+    test_preds /= FOLDS
     return np.mean(loss), test_preds, importance
-
-
-@log_duration
-def CrossValidateLG(X, target, variables, folds=3, params=Params()):
-    lgb_train = lgb.Dataset(X[variables], X[target])
-
-    args = params.MakeArgs(lgb_train)
-    result = lgb.cv(nfold=folds,
-                    early_stopping_rounds=50,
-                    **args)
-    rounds = len(result)
-    test_mean = result['gini-mean'][-1]
-    return test_mean, rounds
-
-
-@log_duration
-def RunModel(
-        train, test, variables, target,
-        early_stopping=False, params=Params):
-    test_y = None
-    if target in test.columns:
-        test_y = test[target]
-
-    predictor, imp = TrainLGB(
-            train[variables], train[target], test[variables],
-            test_y, params, early_stopping=early_stopping)
-
-    def predictor2(X):
-        return predictor(X[variables])
-
-    return predictor2, imp
-
-
-@log_duration
-def TrainLGB(train_X, train_y, test_X, test_y, params, early_stopping=False):
-    lgb_train = lgb.Dataset(train_X, train_y)
-    evals = None
-    if test_y is not None:
-        evals = lgb.Dataset(test_X, test_y)
-
-    early_stopping_rounds = None
-    if early_stopping:
-        early_stopping_rounds = 50
-    # specify your configurations as a dict
-    args = params.MakeArgs(
-            lgb_train, evals=evals,
-            early_stopping_rounds=early_stopping_rounds)
-    # train
-    gbm = lgb.train(**args)
-
-    def predictor(X):
-        return gbm.predict(X, num_iteration=gbm.best_iteration)
-
-    imp = dict(zip(gbm.feature_name(), gbm.feature_importance()))
-
-    return predictor, imp
-
-
-def haversine_array(lat1, lng1, lat2, lng2):
-    lat1, lng1, lat2, lng2 = map(np.radians, (lat1, lng1, lat2, lng2))
-    AVG_EARTH_RADIUS = 6371  # in km
-    lat = lat2 - lat1
-    lng = lng2 - lng1
-    d = (
-            np.sin(lat * 0.5) ** 2 +
-            np.cos(lat1) * np.cos(lat2) * np.sin(lng * 0.5) ** 2)
-    h = 2 * AVG_EARTH_RADIUS * np.arcsin(np.sqrt(d))
-    return h
-
-
-def dummy_manhattan_distance(lat1, lng1, lat2, lng2):
-    a = haversine_array(lat1, lng1, lat1, lng2)
-    b = haversine_array(lat1, lng1, lat2, lng1)
-    return a + b
 
 
 @log_duration
@@ -230,70 +187,6 @@ def gen_features(df):
     for cat in categorical:
         df[cat] += 1
     return df
-
-
-@log_duration
-def gen_features_feature_for_class(train, test):
-    count = {}
-    for r in list(train.normalized_features) + list(test.normalized_features):
-        for f in r:
-            if f not in count:
-                count[f] = 1
-            else:
-                count[f] += 1
-
-    feats = [f for f in count if count[f] > 10]
-
-    columns = {}
-    for f in feats:
-        columns['feature_' + f] = train.normalized_features.apply(
-                lambda r: 1 if f in r else 0)
-    train = train.join(pd.DataFrame(columns, index=train.index))
-
-    columns = {}
-    for f in feats:
-        columns['feature_' + f] = test.normalized_features.apply(
-                lambda r: 1 if f in r else 0)
-    test = test.join(pd.DataFrame(columns, index=test.index))
-
-    return train, test, ['feature_' + f for f in feats]
-
-
-@log_duration
-def gen_features_feature_for_class_v2(train, test):
-    tfidf = CountVectorizer(stop_words='english', max_features=200)
-
-    words_train = train['features'].apply(' '.join)
-    words_test = test['features'].apply(' '.join)
-
-    tr_sparse = tfidf.fit_transform(words_train)
-    variables = ['feature_' + x for x in tfidf.get_feature_names()]
-    wdf = pd.DataFrame(
-            tr_sparse.toarray(), index=train.index, columns=variables)
-    train = train.join(wdf)
-
-    te_sparse = tfidf.transform(words_test)
-    wdf = pd.DataFrame(
-            te_sparse.toarray(), index=test.index, columns=variables)
-    test = test.join(wdf)
-
-    return train, test, variables
-
-
-@log_duration
-def gen_count_feature(column_name, train, test):
-    c = train[column_name]  # .append(test[column_name])
-    grouped = c.groupby(c).agg(['count'])
-
-    output_name = '{}_count'.format(column_name)
-
-    tmp = train.join(grouped, on=column_name).fillna(0)
-    train.loc[:, output_name] = tmp['count'] / (len(train))
-
-    tmp = test.join(grouped, on=column_name).fillna(0)
-    test.loc[:, output_name] = tmp['count'] / (len(train))
-
-    return train, test
 
 
 @log_duration
@@ -315,63 +208,6 @@ def gen_mean_feature_for_target(column_name, train, test, val, target):
     val.loc[:, output_name] = tmp['mean']
 
     return train, test, val, output_name
-
-
-@log_duration
-def compute_adjusted_mean(
-        train_df, test_df, variable, target, adjust_variables):
-    LABELS = [0, 1]
-    train_df = train_df[
-            LABELS + [variable, 'interest_level'] + adjust_variables].copy()
-
-    base_name = "_".join(['adjusted', variable])
-
-    _, _, _, train_pred = RunModel(
-            train_df, test_df, adjust_variables, target,
-            num_rounds=1000, early_stopping=True)
-
-    for i, l in enumerate(LABELS):
-        train_df.loc[:, l+'_pred'] = train_pred[:, i]
-
-    grouped = train_df.groupby(variable)[
-            [x+'_pred'for x in LABELS] + LABELS].agg(["mean"])
-    grouped.columns = (
-            [x+'_pred' for x in LABELS] + [x+'_mean' for x in LABELS])
-
-    test_df = test_df.join(grouped, on=variable)
-
-    cols = {}
-    for i, l in enumerate(LABELS):
-        prior_prob = train_df[l].mean()
-        cols[base_name+'_'+l] = (
-                test_df[l+'_pred'] - test_df[l+'_mean']).fillna(prior_prob)
-
-    print(list(cols.keys()))
-
-    return pd.DataFrame(cols)
-
-
-@log_duration
-def encode_adjusted_mean(train_df, test_df, variable, target, r_k=0.01):
-    adjust_variables = ['price']
-
-    test_df = test_df.join(compute_adjusted_mean(
-        train_df, test_df, variable, target, adjust_variables))
-
-    select = StratifiedKFold(5)
-    acc = []
-    for train_index, test_index in select.split(train_df, train_df[target]):
-        train2 = train_df.iloc[train_index]
-        test2 = train_df.iloc[test_index]
-        acc.append(compute_adjusted_mean(
-            train2, test2, variable, target, adjust_variables))
-
-    acc = pd.concat(acc)
-
-    train_df = train_df.join(acc)
-    # * np.random.uniform(1 - r_k, 1 + r_k, len(acc)))
-
-    return train_df, test_df
 
 
 def compute_hcc(
@@ -653,7 +489,8 @@ def main():
     # feats.extend(f)
 
     param_dict = dict(
-            num_rounds=args.rounds, eta=args.eta,
+            num_rounds=args.rounds,
+            eta=args.eta,
             subsample=0.9,
             colsample=0.8,
             lambda_l1=8,
@@ -683,8 +520,9 @@ def main():
             p = dict(param_dict)
             p.update(params)
 
-            p = Params(**p)
-            score, _, _ = CrossValidate(train, test, TARGET, feats, params=p)
+            factory = LGBMFactory(**p)
+            score, _, _ = CrossValidate(
+                    train, test, TARGET, feats, model_factory=factory)
             logging.info('Score: %f', score)
             if score > best_score:
                 best_score = score
@@ -702,10 +540,10 @@ def main():
         param_dict.update(best_params)
 
     if args.full:
-        params = Params(**param_dict)
+        factory = LGBMFactory(**param_dict)
         logging.info('Training...')
         loss, test_pred, imp = CrossValidate(
-                train, test, TARGET, feats, params=params)
+                train, test, TARGET, feats, model_factory=factory)
 
         for f, w in sorted(imp.items(), key=lambda x: x[1]):
             logging.info('%s %d', f, w)
