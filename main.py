@@ -8,7 +8,6 @@ import logging
 import argparse
 import lightgbm as lgb
 
-from sklearn.feature_extraction.text import CountVectorizer
 # from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
@@ -17,6 +16,8 @@ from numba import jit
 SEED = 265359275
 
 FOLDS = 5
+
+ID_COLUMN = 'id'
 
 
 def log_duration(func):
@@ -37,20 +38,48 @@ def merge_dicts(d1, d2):
             d1[k] += v
 
 
+class NestedClassifiersFactory:
+    def __init__(self, factories):
+        self.factories = factories
+
+    def __call__(self):
+        return NestedClassifiers([factory() for factory in self.factories])
+
+
+class NestedClassifiers:
+    def __init__(self, classifiers):
+        self._classifiers = classifiers
+
+    def fit(self, train, validation=None):
+        for i, classifier in enumerate(self._classifiers):
+            classifier.fit(train, validation)
+            if i < len(self._classifiers) - 1:
+                train = classifier.predict(train)
+                if validation is not None:
+                    validation = classifier.predict(validation)
+
+    def predict(self, X):
+        for classifier in self._classifiers:
+            X = classifier.predict(X)
+        return X
+
+
 class LGBMFactory:
-    def __init__(self, **args):
+    def __init__(self, target, **args):
+        self.target = target
         self.args = args
 
     def __call__(self):
-        return LGBM(**self.args)
+        return LGBM(self.target, **self.args)
 
 
 class LGBM:
     def __init__(
-            self, num_rounds=100, eta=0.3, min_child_weight=1,
+            self, target, num_rounds=100, eta=0.3, min_child_weight=1,
             subsample=0.7, colsample=0.7, num_leaves=31,
             lambda_l1=0, lambda_l2=0, scale_pos_weight=1,
             min_split_gain=1):
+        self.target = target
         self.num_rounds = num_rounds
         self.eta = eta
         self.min_child_weight = min_child_weight
@@ -98,23 +127,27 @@ class LGBM:
         return args
 
     def predict(self, X):
+        if self.target in X.columns:
+            X = X.drop(self.target, axis=1)
+        assert self.features == list(X.columns)
         return self.gbm.predict(X, num_iteration=self.gbm.best_iteration)
 
     @log_duration
-    def fit(self, train_X, train_y, test_X, test_y):
-        lgb_train = lgb.Dataset(train_X, train_y)
-        evals = None
-        if test_y is not None:
-            evals = lgb.Dataset(test_X, test_y)
+    def fit(self, train, test):
+        self.features = list(train.columns)
+        self.features.remove(self.target)
 
-        # specify your configurations as a dict
+        lgb_train = lgb.Dataset(
+                train.drop(self.target, axis=1), train[self.target])
+        evals = None
+        if self.target in test.columns:
+            evals = lgb.Dataset(
+                    test.drop(self.target, axis=1), test[self.target])
+
         args = self._MakeArgs(
                 lgb_train, evals=evals,
                 early_stopping_rounds=50)
-        # train
         self.gbm = lgb.train(**args)
-
-        self.imp = dict(zip(self.gbm.feature_name(), self.gbm.feature_importance()))
 
 
 @jit
@@ -144,41 +177,70 @@ def CostFunction(y_true, y_pred):
     return eval_gini(y_true, y_pred)
 
 
-def CrossValidate(train, test, target, variables, model_factory):
+class CrossValidator:
+    def __init__(self, target, model_factory, folds=FOLDS):
+        self.target = target
+        self.model_factory = model_factory
+        self.folds = folds
+
+    @log_duration
+    def fit(self, train, test=None):
+        loss = []
+        models = []
+
+        select = KFold(self.folds, shuffle=True, random_state=SEED)
+        train_preds = np.zeros(len(train))
+        for train_index, test_index in select.split(train, train[self.target]):
+            sub_train = train.iloc[train_index].copy()
+            sub_val = train.iloc[test_index].copy()
+
+            model = self.model_factory()
+            model.fit(sub_train, sub_val)
+
+            val_pred = model.predict(sub_val)
+            cv = CostFunction(sub_val[self.target], val_pred)
+            loss.append(cv)
+            train_preds[test_index] = val_pred
+
+            models.append(model)
+
+            logging.info('Fold CV: %f, Running CV mean: %f', cv, np.mean(loss))
+        self.models = models
+        self.loss = np.mean(loss)
+        self.train_preds = train_preds
+
+    @log_duration
+    def predict(self, X):
+        preds = []
+        for model in self.models:
+            preds.append(model.predict(X))
+        return sum(preds) / len(preds)
+
+
+def CrossValidate(train, test, target, model_factory):
     loss = []
-    importance = {}
 
     select = KFold(FOLDS, shuffle=True, random_state=SEED)
     test_preds = np.zeros(len(test))
     train_preds = np.zeros(len(train))
-    sub_test = test
     for train_index, test_index in select.split(train, train[target]):
         sub_train = train.iloc[train_index].copy()
         sub_val = train.iloc[test_index].copy()
 
-        sub_features = []
-        sub_train, sub_test, sub_val, sub_features = gen_specialized_features(
-                sub_train, test, sub_val, target)
-        sub_features = variables + sub_features
-
         model = model_factory()
-        model.fit(
-                sub_train[sub_features], sub_train[target],
-                sub_val[sub_features], sub_val[target])
+        model.fit(sub_train, sub_val)
 
-        merge_dicts(importance, model.imp)
-
-        val_pred = model.predict(sub_val[sub_features])
+        val_pred = model.predict(sub_val.drop(target, axis=1))
         cv = CostFunction(np.array(sub_val[target]), np.array(val_pred))
         loss.append(cv)
         train_preds[test_index] = val_pred
 
-        test_pred = model.predict(sub_test[sub_features])
+        test_pred = model.predict(test)
         test_preds += test_pred
 
         logging.info('Fold CV: %f, Running CV mean: %f', cv, np.mean(loss))
     test_preds /= FOLDS
-    return np.mean(loss), test_preds, importance
+    return np.mean(loss), test_preds, train_preds
 
 
 @log_duration
@@ -210,6 +272,34 @@ def gen_mean_feature_for_target(column_name, train, test, val, target):
     return train, test, val, output_name
 
 
+class HCCEncoder:
+    def __init__(self, variable, target, min_samples_leaf, smoothing):
+        self.variable = variable
+        self.target = target
+        self.min_samples_leaf = min_samples_leaf
+        self.smoothing = smoothing
+
+    def fit(self, train_X, train_y=None, test_X=None, test_y=None):
+        prior_prob = train_X[self.target].mean()
+
+        hcc_name = "_".join(['hcc', self.variable, self.target])
+
+        grouped = train_X.groupby(self.variable)
+        grouped = grouped[self.target].agg(["size", "mean"])
+
+        smoothing = 1/(1+np.exp(
+            -(grouped["size"]-self.min_samples_leaf)/self.smoothing))
+
+        grouped[hcc_name] = (
+                prior_prob * (1 - smoothing) +
+                grouped["mean"] * smoothing)
+
+        self.grouped = grouped[[hcc_name]]
+
+    def predict(self, X):
+        return X.join(self.grouped, on=self.variable)
+
+
 def compute_hcc(
         train_df, test_df, val_df, variable,
         target, min_samples_leaf=1, smoothing=1):
@@ -235,7 +325,7 @@ def compute_hcc(
     test_df = test_df.join(grouped, on=variable)
     val_df = val_df.join(grouped, on=variable)
 
-    return train_df, test_df, val_df, hcc_name
+    return train_df, test_df, val_df
 
 
 @log_duration
@@ -283,17 +373,22 @@ def single_out(train_df, test_df, variable):
     return train_df, test_df
 
 
-@log_duration
-def gen_specialized_features(train, test, val, target):
-    features = []
+class SpecializedFeatures:
+    def __init__(self, target):
+        self.target = target
 
-    categorical = list(name for name in train.columns if name.endswith('_cat'))
-    for cat in categorical:
-        train, test, val, feature = hcc_encode(
-                train, test, val, cat, target)
-        features.append(feature)
+    def fit(self, train, test=None):
+        categorical = list(
+                name for name in train.columns if name.endswith('_cat'))
+        classifiers = []
+        for cat in categorical:
+            classifiers.append(HCCEncoder(cat, self.target, 200, 10))
 
-    return train, test, val, features
+        self.classifier = NestedClassifiers(classifiers)
+        self.classifier.fit(train)
+
+    def predict(self, X):
+        return self.classifier.predict(X)
 
 
 @log_duration
@@ -328,14 +423,14 @@ def preCVFeatures(train, test):
 
 @log_duration
 def load_train_data():
-    df = pd.read_csv('train.csv.gz')
+    df = pd.read_csv('train.csv.gz', index_col=ID_COLUMN)
     print(df.describe())
     return df
 
 
 @log_duration
 def load_test_data():
-    df = pd.read_csv('test.csv.gz')
+    df = pd.read_csv('test.csv.gz', index_col=ID_COLUMN)
     print(df.describe())
     return df
 
@@ -356,6 +451,14 @@ def product_params(args):
     r = random.SystemRandom()
     r.shuffle(output)
     return output
+
+
+def MakeModelFactory(target, lgbm_params):
+
+    return NestedClassifiersFactory([
+        lambda: SpecializedFeatures(target),
+        LGBMFactory(target, **lgbm_params),
+    ])
 
 
 def main():
@@ -480,10 +583,9 @@ def main():
     ]
 
     TARGET = 'target'
-    ID_COLUMN = 'id'
 
-    train = train[feats + [TARGET, ID_COLUMN]]
-    test = test[feats + [ID_COLUMN]]
+    train = train[feats + [TARGET]]
+    test = test[feats]
 
     # train, test, f = preCVFeatures(train, test)
     # feats.extend(f)
@@ -520,9 +622,9 @@ def main():
             p = dict(param_dict)
             p.update(params)
 
-            factory = LGBMFactory(**p)
+            factory = MakeModelFactory(TARGET, p)
             score, _, _ = CrossValidate(
-                    train, test, TARGET, feats, model_factory=factory)
+                    train, test, TARGET, model_factory=factory)
             logging.info('Score: %f', score)
             if score > best_score:
                 best_score = score
@@ -540,28 +642,26 @@ def main():
         param_dict.update(best_params)
 
     if args.full:
-        factory = LGBMFactory(**param_dict)
+        factory = MakeModelFactory(TARGET, param_dict)
         logging.info('Training...')
-        loss, test_pred, imp = CrossValidate(
-                train, test, TARGET, feats, model_factory=factory)
+        validator = CrossValidator(TARGET, factory)
+        validator.fit(train, test)
+        logging.info('CV Score: %f', validator.loss)
 
-        for f, w in sorted(imp.items(), key=lambda x: x[1]):
-            logging.info('%s %d', f, w)
+        logging.info('Evaluating test set...')
+        test_pred = validator.predict(test)
 
         logging.info('Prediction mean: %f', test_pred.mean())
-
         logging.info('Train mean: %f', train[TARGET].mean())
-
-        logging.info('CV Score: %f', loss)
 
         test[TARGET] = test_pred
 
-        test = test.sort_values(ID_COLUMN)
+        test = test.sort_index()
 
         test.to_csv(
                 'solution.csv.gz',
-                columns=[ID_COLUMN] + [TARGET],
-                index=False, compression='gzip')
+                columns=[TARGET],
+                index=True, compression='gzip')
 
 
 if __name__ == '__main__':
