@@ -176,7 +176,7 @@ class NNModel:
         self.model = Sequential()
 
         positive = train[self.target] == 1
-        train = pd.concat([train, train[positive]])
+        train = pd.concat([train] + [train[positive]]*4)
 
         train = self.filter_data(train)
         test = self.filter_data(test)
