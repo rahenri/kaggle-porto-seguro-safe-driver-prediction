@@ -22,16 +22,6 @@ ID_COLUMN = 'id'
 def gen_features(df):
     df['negative_vals'] = np.sum((df == -1).values, axis=1)
 
-    to_drop = {
-            'ps_car_11_cat', 'ps_ind_14', 'ps_car_11', 'ps_car_14',
-            'ps_ind_06_bin', 'ps_ind_09_bin', 'ps_ind_10_bin',
-            'ps_ind_11_bin', 'ps_ind_12_bin', 'ps_ind_13_bin'}
-
-    cols_use = [
-            c for c in df.columns if (not c.startswith('ps_calc_'))
-            and (c not in to_drop)]
-    df = df[cols_use].copy()
-
     df = df.replace(-1, np.NaN)
 
     df['ps_car_13_x_ps_reg_03'] = df['ps_car_13'] * df['ps_reg_03']
@@ -170,12 +160,27 @@ class NNModel:
     def __init__(self, target):
         self.target = target
 
+    def filter_data(self, df):
+        to_drop = {
+                'ps_car_11_cat', 'ps_ind_14', 'ps_car_11', 'ps_car_14',
+                'ps_ind_06_bin', 'ps_ind_09_bin', 'ps_ind_10_bin',
+                'ps_ind_11_bin', 'ps_ind_12_bin', 'ps_ind_13_bin'}
+
+        cols_use = [
+                c for c in df.columns if (not c.startswith('ps_calc_'))
+                and (c not in to_drop)]
+        return df[cols_use].copy()
+
     def fit(self, train, test=None):
         print(train.columns)
         self.model = Sequential()
 
         positive = train[self.target] == 1
         train = pd.concat([train, train[positive]])
+
+        train = self.filter_data(train)
+        test = self.filter_data(test)
+
 
         train_X = train.drop(self.target, axis=1)
         train_y = train[self.target]
@@ -207,6 +212,7 @@ class NNModel:
                 callbacks=[GiniCallback(self.target, train, test)])
 
     def predict(self, X):
+        X = self.filter_data(X)
         if self.target in X.columns:
             X = X.drop(self.target, axis=1)
         return self.model.predict(np.array(X), batch_size=2048).reshape([-1])
@@ -216,7 +222,7 @@ def MakeModelFactory(target, nn_params):
     base_model = common.NestedClassifiersFactory([
         lambda: SpecializedFeatures(target),
         common.AverageClassifierFactory(
-            NNModelFactory(target, **nn_params), 1),
+            NNModelFactory(target, **nn_params), 3),
     ])
     return lambda: common.CrossValidator(target, base_model)
 

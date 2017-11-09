@@ -5,7 +5,7 @@ import lightgbm as lgb
 import pandas as pd
 
 from numba import jit
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 
 SEED = 265359275
 
@@ -245,7 +245,7 @@ class CrossValidator:
         loss = []
         models = []
 
-        select = KFold(self.folds, shuffle=True, random_state=SEED)
+        select = StratifiedKFold(self.folds, shuffle=True, random_state=SEED)
         train_preds = np.zeros(len(train))
         for train_index, test_index in select.split(train, train[self.target]):
             sub_train = train.iloc[train_index].copy()
