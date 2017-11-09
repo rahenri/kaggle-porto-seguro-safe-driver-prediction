@@ -32,6 +32,12 @@ def gen_features(df):
             and (c not in to_drop)]
     df = df[cols_use].copy()
 
+    df = df.replace(-1, np.NaN)
+
+    df['ps_car_13_x_ps_reg_03'] = df['ps_car_13'] * df['ps_reg_03']
+
+    df = df.fillna(-1)
+
     return df
 
 
