@@ -8,17 +8,30 @@ import argparse
 import common
 
 # from sklearn.model_selection import StratifiedKFold
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import OneHotEncoder
+# from sklearn.preprocessing import LabelEncoder
+from keras.models import Sequential
+from keras.layers import Dense, Activation, Dropout
+from keras.optimizers import Adam
+from keras.callbacks import Callback
 
 ID_COLUMN = 'id'
 
 
 @common.log_duration
 def gen_features(df):
-    categorical = list(name for name in df.columns if name.endswith('_cat'))
-    for cat in categorical:
-        df[cat] += 1
+    df['negative_vals'] = np.sum((df == -1).values, axis=1)
+
+    to_drop = {
+            'ps_car_11_cat', 'ps_ind_14', 'ps_car_11', 'ps_car_14',
+            'ps_ind_06_bin', 'ps_ind_09_bin', 'ps_ind_10_bin',
+            'ps_ind_11_bin', 'ps_ind_12_bin', 'ps_ind_13_bin'}
+
+    cols_use = [
+            c for c in df.columns if (not c.startswith('ps_calc_'))
+            and (c not in to_drop)]
+    df = df[cols_use].copy()
+
     return df
 
 
@@ -43,78 +56,47 @@ def binarize_feature(train, test, column):
     return train, test, feat_names
 
 
-@common.log_duration
-def single_out(train_df, test_df, variable):
-    data = train_df[variable].append(test_df[variable])
-    grouped = data.groupby(data).agg(['size'])
-
-    train_df.loc[
-            train_df.join(grouped, on=variable)['size'] <= 1, variable] = -1
-    test_df.loc[
-            test_df.join(grouped, on=variable)['size'] <= 1, variable] = -1
-
-    return train_df, test_df
-
-
 class SpecializedFeatures:
     def __init__(self, target):
         self.target = target
 
     def fit(self, train, test=None):
-        categorical = list(
-                name for name in train.columns if name.endswith('_cat'))
-        classifiers = []
-        for cat in categorical:
-            classifiers.append(common.HCCEncoder(cat, self.target, 200, 10))
-
-        self.classifier = common.NestedClassifiers(classifiers)
-        self.classifier.fit(train)
+        encoders = {}
+        variables = list(train.columns)
+        for var in variables:
+            uniq = np.unique(train[var])
+            if len(uniq) <= 2 or len(uniq) >= 105:
+                continue
+            encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+            encoder.fit(train[[var]]+1)
+            encoders[var] = encoder
+        self.encoders = encoders
 
     def predict(self, X):
-        return self.classifier.predict(X)
+        X = X.copy()
+        for name, enc in self.encoders.items():
+            out = enc.transform(X[[name]]+1)
+            for i in range(len(out[1])):
+                X['{}_{}'.format(name, i)] = out[:, i]
+
+        return X
 
 
 @common.log_duration
 def preCVFeatures(train, test):
-    combs = [
-        ('ps_reg_01', 'ps_car_02_cat'),
-        ('ps_reg_01', 'ps_car_04_cat'),
-    ]
 
-    features = []
-
-    for n_c, (f1, f2) in enumerate(combs):
-        name1 = f1 + "_plus_" + f2 + '_joined'
-        print('current feature %60s %4d' % (name1, n_c + 1))
-
-        train[name1] = (
-                train[f1].apply(lambda x: str(x)) + "_" +
-                train[f2].apply(lambda x: str(x)))
-        test[name1] = (
-                test[f1].apply(lambda x: str(x)) + "_" +
-                test[f2].apply(lambda x: str(x)))
-        # Label Encode
-        lbl = LabelEncoder()
-        lbl.fit(list(train[name1].values) + list(test[name1].values))
-        train[name1] = lbl.transform(list(train[name1].values))
-        test[name1] = lbl.transform(list(test[name1].values))
-
-        features.append(name1)
-
-    return train, test, features
+    return train, test
 
 
 @common.log_duration
 def load_train_data():
     df = pd.read_csv('train.csv.gz', index_col=ID_COLUMN)
-    print(df.describe())
     return df
 
 
 @common.log_duration
 def load_test_data():
     df = pd.read_csv('test.csv.gz', index_col=ID_COLUMN)
-    print(df.describe())
     return df
 
 
@@ -136,19 +118,101 @@ def product_params(args):
     return output
 
 
-def MakeModelFactory(target, *lgbm_params):
+class NNModelFactory:
+    def __init__(self, target):
+        self.target = target
 
-    base_models = []
-    for params in lgbm_params:
-        base_models.append(common.NestedClassifiersFactory([
-            lambda: SpecializedFeatures(target),
-            common.LGBMFactory(target, **params),
-        ]))
+    def __call__(self):
+        return NNModel(self.target)
 
-    stacker_factory = common.SKLearnWrapperFactory(
-            target, lambda: LogisticRegression())
 
-    return lambda: common.Ensemble(target, stacker_factory, base_models)
+class GiniCallback(Callback):
+    def __init__(self, target, train, val):
+        self.target = target
+        self.train = train
+        self.val = val
+
+    def on_train_begin(self, logs={}):
+        pass
+
+    def on_train_end(self, logs={}):
+        pass
+
+    def on_epoch_begin(self, epoch, logs={}):
+        pass
+
+    def compute_gini(self, df):
+        y_pred_val = self.model.predict(
+                np.array(df.drop(self.target, axis=1)),
+                batch_size=2048)
+        return common.eval_gini(df[self.target], y_pred_val.reshape([-1]))
+
+    def on_epoch_end(self, epoch, logs={}):
+        val_gini = self.compute_gini(self.val)
+        train_gini = self.compute_gini(self.train)
+        print('\ngini-train: {:.5f} gini-val: {:.5f}'.format(
+            train_gini, val_gini))
+
+    def on_batch_begin(self, batch, logs={}):
+        pass
+
+    def on_batch_end(self, batch, logs={}):
+        pass
+
+
+class NNModel:
+    def __init__(self, target):
+        self.target = target
+
+    def fit(self, train, test=None):
+        print(train.columns)
+        self.model = Sequential()
+
+        positive = train[self.target] == 1
+        train = pd.concat([train, train[positive]])
+
+        train_X = train.drop(self.target, axis=1)
+        train_y = train[self.target]
+
+        self.model.add(Dense(
+            units=35, activation='relu', input_dim=len(train_X.columns)))
+        self.model.add(Dropout(0.3))
+        self.model.add(Dense(units=1))
+        self.model.add(Activation('sigmoid'))
+
+        optimizer = Adam(lr=0.001)
+
+        self.model.compile(
+                loss='binary_crossentropy',
+                optimizer=optimizer)
+
+        validation_data = None
+        if test is not None:
+            validation_data = (
+                    np.array(test.drop(self.target, axis=1)),
+                    np.array(test[self.target]))
+
+        self.model.fit(
+                np.array(train_X),
+                np.array(train_y),
+                batch_size=2048,
+                epochs=15,
+                validation_data=validation_data,
+                callbacks=[GiniCallback(self.target, train, test)])
+
+    def predict(self, X):
+        if self.target in X.columns:
+            X = X.drop(self.target, axis=1)
+        return self.model.predict(np.array(X), batch_size=2048).reshape([-1])
+
+
+def MakeModelFactory(target, nn_params):
+    base_model = common.NestedClassifiersFactory([
+        lambda: SpecializedFeatures(target),
+        common.AverageClassifierFactory(
+            NNModelFactory(target, **nn_params), 1),
+    ])
+    return lambda: common.CrossValidator(target, base_model)
 
 
 def main():
@@ -177,82 +241,9 @@ def main():
     train = gen_features(load_train_data())
     test = gen_features(load_test_data())
 
-    feats = [
-      "ps_car_13",
-      "ps_reg_03",
-      "ps_ind_05_cat",
-      "ps_ind_03",
-      "ps_ind_15",
-      "ps_reg_02",
-      "ps_car_14",
-      "ps_car_12",
-      "ps_car_01_cat",
-      "ps_car_07_cat",
-      "ps_ind_17_bin",
-      "ps_car_03_cat",
-      "ps_reg_01",
-      "ps_car_15",
-      "ps_ind_01",
-      "ps_ind_16_bin",
-      "ps_ind_07_bin",
-      "ps_car_06_cat",
-      "ps_car_04_cat",
-      "ps_ind_06_bin",
-      "ps_car_09_cat",
-      "ps_car_02_cat",
-      "ps_ind_02_cat",
-      "ps_car_11",
-      "ps_car_05_cat",
-      "ps_calc_09",
-      "ps_calc_05",
-      "ps_ind_08_bin",
-      "ps_car_08_cat",
-      "ps_ind_09_bin",
-      "ps_ind_04_cat",
-      "ps_ind_18_bin",
-      "ps_ind_12_bin",
-      "ps_ind_14",
-    ]
-
     TARGET = 'target'
 
-    train = train[feats + [TARGET]]
-    test = test[feats]
-
-    # train, test, f = preCVFeatures(train, test)
-    # feats.extend(f)
-
-    param_dict1 = dict(
-            num_rounds=args.rounds,
-            eta=args.eta,
-            subsample=0.9,
-            colsample=0.8,
-            lambda_l1=8,
-            lambda_l2=1.8,
-            num_leaves=25,
-            min_child_weight=6,
-            scale_pos_weight=1.6,
-            min_split_gain=1)
-
-    param_dict2 = dict(
-            num_rounds=args.rounds,
-            eta=args.eta,
-            subsample=0.8,
-            colsample=0.8,
-            lambda_l1=8,
-            lambda_l2=3,
-            num_leaves=15,
-            min_child_weight=6,
-            scale_pos_weight=1.6,
-            min_split_gain=2,
-            max_depth=4)
-
-    param_dict3 = dict(
-            num_rounds=args.rounds,
-            eta=args.eta,
-            max_depth=4)
-
-    param_dicts = [param_dict1, param_dict2, param_dict3]
+    nn_params = dict()
 
     if args.search:
         params_space = dict(
@@ -271,7 +262,7 @@ def main():
             params = dict(params)
             logging.info('-----------------------------------------------')
             logging.info('Params: %s', params)
-            p = dict(param_dicts[0])
+            p = dict(nn_params)
             p.update(params)
 
             factory = MakeModelFactory(TARGET, p)
@@ -294,7 +285,7 @@ def main():
             logging.info('Params: %s', params)
 
     if args.full:
-        factory = MakeModelFactory(TARGET, *param_dicts)
+        factory = MakeModelFactory(TARGET, nn_params)
         logging.info('Training...')
         validator = factory()
         validator.fit(train)
@@ -311,7 +302,7 @@ def main():
         test = test.sort_index()
 
         test.to_csv(
-                'solution.csv.gz',
+                'solution-nn.csv.gz',
                 columns=[TARGET],
                 index=True, compression='gzip')
 
