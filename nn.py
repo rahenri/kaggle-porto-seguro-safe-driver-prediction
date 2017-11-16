@@ -56,6 +56,7 @@ class SpecializedFeatures:
     def __init__(self, target):
         self.target = target
 
+    @common.log_duration
     def fit(self, train, test=None):
         encoders = {}
         variables = list(train.columns)
@@ -68,6 +69,7 @@ class SpecializedFeatures:
             encoders[var] = encoder
         self.encoders = encoders
 
+    @common.log_duration
     def predict(self, X):
         X = X.copy()
         for name, enc in self.encoders.items():
@@ -141,7 +143,7 @@ class GiniCallback(Callback):
         y_pred_val = self.model.predict(
                 np.array(df.drop(self.target, axis=1)),
                 batch_size=2048)
-        return common.eval_gini(df[self.target], y_pred_val.reshape([-1]))
+        return common.CostFunction(df[self.target], y_pred_val.reshape([-1]))
 
     def on_epoch_end(self, epoch, logs={}):
         val_gini = self.compute_gini(self.val)
@@ -160,6 +162,7 @@ class NNModel:
     def __init__(self, target):
         self.target = target
 
+    @common.log_duration
     def filter_data(self, df):
         to_drop = {
                 'ps_car_11_cat', 'ps_ind_14', 'ps_car_11', 'ps_car_14',
@@ -171,31 +174,38 @@ class NNModel:
                 and (c not in to_drop)]
         return df[cols_use].copy()
 
+    @common.log_duration
+    def make_model(self, input_size, hidden_units):
+        model = Sequential()
+        model.add(Dense(
+            units=hidden_units, activation='relu', input_dim=input_size))
+        model.add(Dropout(0.3))
+        model.add(Dense(units=1))
+        model.add(Activation('sigmoid'))
+
+        optimizer = Adam(lr=0.001)
+
+        model.compile(loss='binary_crossentropy', optimizer=optimizer)
+        return model
+
+    @common.log_duration
+    def upsample(self, train):
+        positive = train[self.target] == 1
+        return pd.concat([train] + [train[positive]]*4)
+
+    @common.log_duration
     def fit(self, train, test=None):
         print(train.columns)
-        self.model = Sequential()
 
-        positive = train[self.target] == 1
-        train = pd.concat([train] + [train[positive]]*4)
+        train = self.upsample(train)
 
         train = self.filter_data(train)
         test = self.filter_data(test)
 
-
         train_X = train.drop(self.target, axis=1)
         train_y = train[self.target]
 
-        self.model.add(Dense(
-            units=35, activation='relu', input_dim=len(train_X.columns)))
-        self.model.add(Dropout(0.3))
-        self.model.add(Dense(units=1))
-        self.model.add(Activation('sigmoid'))
-
-        optimizer = Adam(lr=0.001)
-
-        self.model.compile(
-                loss='binary_crossentropy',
-                optimizer=optimizer)
+        self.model = self.make_model(len(train_X.columns), 35)
 
         validation_data = None
         if test is not None:
@@ -207,10 +217,11 @@ class NNModel:
                 np.array(train_X),
                 np.array(train_y),
                 batch_size=2048,
-                epochs=15,
+                epochs=10,
                 validation_data=validation_data,
                 callbacks=[GiniCallback(self.target, train, test)])
 
+    @common.log_duration
     def predict(self, X):
         X = self.filter_data(X)
         if self.target in X.columns:
@@ -220,11 +231,22 @@ class NNModel:
 
 def MakeModelFactory(target, nn_params):
     base_model = common.NestedClassifiersFactory([
-        lambda: SpecializedFeatures(target),
         common.AverageClassifierFactory(
             NNModelFactory(target, **nn_params), 3),
     ])
-    return lambda: common.CrossValidator(target, base_model)
+    return common.NestedClassifiersFactory([
+        lambda: SpecializedFeatures(target),
+        lambda: common.CrossValidator(target, base_model),
+    ])
+
+
+@common.log_duration
+def SaveDF(df, path, columns):
+    df.to_csv(
+            path,
+            columns=columns,
+            index=True,
+            compression='gzip')
 
 
 def main():
@@ -310,13 +332,10 @@ def main():
         logging.info('Train mean: %f', train[TARGET].mean())
 
         test[TARGET] = test_pred
+        train[TARGET] = validator.train_preds
 
-        test = test.sort_index()
-
-        test.to_csv(
-                'solution-nn.csv.gz',
-                columns=[TARGET],
-                index=True, compression='gzip')
+        common.SaveDF(test, 'solution-nn.csv.gz', columns=[TARGET])
+        common.SaveDF(train, 'train-nn.csv.gz', columns=[TARGET])
 
 
 if __name__ == '__main__':

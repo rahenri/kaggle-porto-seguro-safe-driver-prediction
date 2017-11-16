@@ -8,7 +8,7 @@ import argparse
 import common
 
 # from sklearn.model_selection import StratifiedKFold
-from sklearn.linear_model import LogisticRegression
+# from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
 
 ID_COLUMN = 'id'
@@ -136,28 +136,23 @@ def product_params(args):
     return output
 
 
-def MakeModelFactory(target, *lgbm_params):
-
-    base_models = []
-    for params in lgbm_params:
-        base_models.append(common.NestedClassifiersFactory([
-            lambda: SpecializedFeatures(target),
-            common.LGBMFactory(target, **params),
-        ]))
-
-    stacker_factory = common.SKLearnWrapperFactory(
-            target, lambda: LogisticRegression())
-
-    return lambda: common.Ensemble(target, stacker_factory, base_models)
+def MakeModelFactory(target, lgbm_params):
+    return lambda: common.CrossValidator(
+            target,
+            common.NestedClassifiersFactory([
+                lambda: SpecializedFeatures(target),
+                common.UpsamplerFactory(
+                    target, common.LGBMFactory(target, **lgbm_params)),
+                ]))
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-            '--rounds', default=20000, type=int,
+            '--rounds', default=650, type=int,
             help='Max number of boosting rounds')
     parser.add_argument(
-            '--eta', default=0.07, type=float, help='Learning rate')
+            '--eta', default=0.02, type=float, help='Learning rate')
     parser.add_argument(
             '--full', default=False, action='store_true',
             help='Whether to do full train and evaluate test')
@@ -232,35 +227,38 @@ def main():
             num_leaves=25,
             min_child_weight=6,
             scale_pos_weight=1.6,
-            min_split_gain=1)
+            min_split_gain=1,
+            early_stopping=None,
+    )
 
-    param_dict2 = dict(
-            num_rounds=args.rounds,
-            eta=args.eta,
-            subsample=0.8,
-            colsample=0.8,
-            lambda_l1=8,
-            lambda_l2=3,
-            num_leaves=15,
-            min_child_weight=6,
-            scale_pos_weight=1.6,
-            min_split_gain=2,
-            max_depth=4)
+    # param_dict2 = dict(
+    #         num_rounds=args.rounds,
+    #         eta=args.eta,
+    #         subsample=0.8,
+    #         colsample=0.8,
+    #         lambda_l1=8,
+    #         lambda_l2=3,
+    #         num_leaves=15,
+    #         min_child_weight=6,
+    #         scale_pos_weight=1.6,
+    #         min_split_gain=2,
+    #         max_depth=4)
 
-    param_dict3 = dict(
-            num_rounds=args.rounds,
-            eta=args.eta,
-            max_depth=4)
+    # param_dict3 = dict(
+    #         num_rounds=args.rounds,
+    #         eta=args.eta,
+    #         max_depth=4)
 
-    param_dicts = [param_dict1, param_dict2, param_dict3]
+    param_dicts = [param_dict1]
 
     if args.search:
         params_space = dict(
-            num_leaves=[10, 15, 20, 25, 31],
+            num_rounds=[700, 750, 650],
         )
 
         best_score = -1e100
         best_params = None
+        best_model = None
 
         history = []
 
@@ -275,7 +273,7 @@ def main():
             p.update(params)
 
             factory = MakeModelFactory(TARGET, p)
-            validator = common.CrossValidator(TARGET, factory)
+            validator = factory()
             validator.fit(train)
             score = validator.loss
 
@@ -283,6 +281,7 @@ def main():
             if score > best_score:
                 best_score = score
                 best_params = params
+                best_model = validator
                 logging.info('Best score so far')
             logging.info('Current best score: %f', best_score)
             logging.info('Current best params: %s', best_params)
@@ -292,6 +291,17 @@ def main():
             logging.info('='*80)
             logging.info('Score: %f', score)
             logging.info('Params: %s', params)
+
+        test_pred = best_model.predict(test)
+
+        logging.info('Prediction mean: %f', test_pred.mean())
+        logging.info('Train mean: %f', train[TARGET].mean())
+
+        test[TARGET] = test_pred
+        train[TARGET] = validator.train_preds
+
+        common.SaveDF(test, 'solution-lgbm.csv.gz', columns=[TARGET])
+        common.SaveDF(train, 'train-lgbm.csv.gz', columns=[TARGET])
 
     if args.full:
         factory = MakeModelFactory(TARGET, *param_dicts)
@@ -307,13 +317,10 @@ def main():
         logging.info('Train mean: %f', train[TARGET].mean())
 
         test[TARGET] = test_pred
+        train[TARGET] = validator.train_preds
 
-        test = test.sort_index()
-
-        test.to_csv(
-                'solution.csv.gz',
-                columns=[TARGET],
-                index=True, compression='gzip')
+        common.SaveDF(test, 'solution-lgbm.csv.gz', columns=[TARGET])
+        common.SaveDF(train, 'train-lgbm.csv.gz', columns=[TARGET])
 
 
 if __name__ == '__main__':

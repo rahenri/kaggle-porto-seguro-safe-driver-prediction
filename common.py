@@ -12,6 +12,18 @@ SEED = 265359275
 FOLDS = 5
 
 
+def log_duration(func):
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        logging.info(
+                'Function %s started', func.__qualname__)
+        ret = func(*args, **kwargs)
+        logging.info(
+                'Function %s took %fs', func.__qualname__, time.time() - start)
+        return ret
+    return wrapper
+
+
 @jit
 def eval_gini(y_true, y_prob):
     y_true = np.asarray(y_true)
@@ -39,16 +51,6 @@ def CostFunction(y_true, y_pred):
     return eval_gini(y_true, y_pred)
 
 
-def log_duration(func):
-    def wrapper(*args, **kwargs):
-        start = time.time()
-        ret = func(*args, **kwargs)
-        logging.info(
-                'Function %s took %fs', func.__name__, time.time() - start)
-        return ret
-    return wrapper
-
-
 def merge_dicts(d1, d2):
     for k, v in d2.items():
         if k not in d1:
@@ -71,10 +73,12 @@ class SKLearnWrapper:
         self.target = target
         self.classifier = classifier
 
+    @log_duration
     def fit(self, train, val=None):
         self.classifier.fit(
                 train.drop(self.target, axis=1), train[self.target])
 
+    @log_duration
     def predict(self, X):
         if self.target in X.columns:
             X = X.drop(self.target, axis=1)
@@ -101,6 +105,14 @@ class NestedClassifiers:
                 if validation is not None:
                     validation = classifier.predict(validation)
 
+    @property
+    def loss(self):
+        return self._classifiers[-1].loss
+
+    @property
+    def train_preds(self):
+        return self._classifiers[-1].train_preds
+
     def predict(self, X):
         for classifier in self._classifiers:
             X = classifier.predict(X)
@@ -121,7 +133,7 @@ class LGBM:
             self, target, num_rounds=100, eta=0.3, min_child_weight=None,
             subsample=None, colsample=None, num_leaves=None,
             lambda_l1=None, lambda_l2=None, scale_pos_weight=None,
-            min_split_gain=None, max_depth=None):
+            min_split_gain=None, max_depth=None, early_stopping=None):
         self.target = target
         self.num_rounds = num_rounds
         self.eta = eta
@@ -134,8 +146,9 @@ class LGBM:
         self.scale_pos_weight = scale_pos_weight
         self.min_split_gain = min_split_gain
         self.max_depth = max_depth
+        self.early_stopping = early_stopping
 
-    def _MakeArgs(self, train_set, evals=None, early_stopping_rounds=None):
+    def _MakeArgs(self, train_set, evals=None):
         params = {
             'task': 'train',
             'boosting_type': 'gbdt',
@@ -163,13 +176,13 @@ class LGBM:
             train_set=train_set,
             num_boost_round=self.num_rounds,
             feval=gini_xgb,
-            verbose_eval=0,
+            verbose_eval=10,
         )
 
         if evals:
             args['valid_sets'] = evals
-        if early_stopping_rounds is not None:
-            args['early_stopping_rounds'] = early_stopping_rounds
+        if self.early_stopping is not None:
+            args['early_stopping_rounds'] = self.early_stopping
 
         return args
 
@@ -192,8 +205,7 @@ class LGBM:
                     test.drop(self.target, axis=1), test[self.target])
 
         args = self._MakeArgs(
-                lgb_train, evals=evals,
-                early_stopping_rounds=50)
+                lgb_train, evals=evals)
         self.gbm = lgb.train(**args)
 
 
@@ -204,6 +216,7 @@ class Ensemble(object):
         self.stacker_factory = stacker_factory
         self.model_factories = model_factories
 
+    @log_duration
     def fit(self, train, test=None):
 
         preds = pd.DataFrame()
@@ -223,8 +236,8 @@ class Ensemble(object):
         self.stacker = CrossValidator(
                 self.target, self.stacker_factory, folds=self.folds)
         self.stacker.fit(preds)
-        self.loss = self.stacker.loss
 
+    @log_duration
     def predict(self, X):
         preds = pd.DataFrame(index=X.index)
         for i, classifier in enumerate(self.classifiers):
@@ -232,6 +245,14 @@ class Ensemble(object):
             preds.loc[:, 'model_{}'.format(i)] = pred
         print(preds.describe())
         return self.stacker.predict(preds)
+
+    @property
+    def loss(self):
+        return self.stacker.loss
+
+    @property
+    def train_preds(self):
+        return self.stacker.train_preds
 
 
 class CrossValidator:
@@ -330,3 +351,43 @@ class AverageClassifier:
         for model in self.models:
             preds.append(model.predict(X))
         return sum(preds) / len(preds)
+
+
+@log_duration
+def SaveDF(df, path, columns):
+    df.to_csv(
+            path,
+            columns=columns,
+            index=True,
+            compression='gzip')
+
+
+class UpsamplerFactory:
+    def __init__(self, target, base_model_factory):
+        self.factory = base_model_factory
+        self.target = target
+
+    def __call__(self):
+        return Upsampler(self.target, self.factory())
+
+
+class Upsampler:
+    def __init__(self, target, base_model):
+        self.target = target
+        self.base_model = base_model
+
+    def fit(self, train, validation=None):
+        positive = train[self.target] == 1
+        train = pd.concat([train] + [train[positive]]*4)
+        return self.base_model.fit(train, validation)
+
+    def predict(self, X):
+        return self.base_model.predict(X)
+
+    @property
+    def loss(self):
+        return self.base_model.loss
+
+    @property
+    def train_preds(self):
+        return self.base_model.train_preds
