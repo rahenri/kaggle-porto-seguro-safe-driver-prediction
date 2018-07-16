@@ -1,0 +1,6 @@
+
+with feature scaler: 0.274462
+without feature scaler: 0.274077
+
+without scaler mean: 0.276353
+
