@@ -7,6 +7,8 @@ import logging
 import argparse
 import common
 
+import tensorflow as tf
+
 # from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder
 # from sklearn.preprocessing import LabelEncoder
@@ -64,14 +66,15 @@ class SpecializedFeatures:
             uniq = np.unique(train[var])
             if len(uniq) <= 2 or len(uniq) >= 105:
                 continue
-            encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+            encoder = OneHotEncoder(
+                    sparse=False, handle_unknown='ignore', dtype='int8')
             encoder.fit(train[[var]]+1)
             encoders[var] = encoder
         self.encoders = encoders
 
     @common.log_duration
     def predict(self, X):
-        X = X.copy()
+        X = X.copy(deep=False)
         for name, enc in self.encoders.items():
             out = enc.transform(X[[name]]+1)
             for i in range(len(out[1])):
@@ -116,14 +119,6 @@ def product_params(args):
     return output
 
 
-class NNModelFactory:
-    def __init__(self, target):
-        self.target = target
-
-    def __call__(self):
-        return NNModel(self.target)
-
-
 class GiniCallback(Callback):
     def __init__(self, target, train, val):
         self.target = target
@@ -139,11 +134,11 @@ class GiniCallback(Callback):
     def on_epoch_begin(self, epoch, logs={}):
         pass
 
-    def compute_gini(self, df):
-        y_pred_val = self.model.predict(
-                np.array(df.drop(self.target, axis=1)),
-                batch_size=2048)
-        return common.CostFunction(df[self.target], y_pred_val.reshape([-1]))
+    def compute_gini(self, data):
+        data_X, data_y = data
+
+        y_pred_val = self.model.predict(data_X, batch_size=2048)
+        return common.CostFunction(data_y, y_pred_val.reshape([-1]))
 
     def on_epoch_end(self, epoch, logs={}):
         val_gini = self.compute_gini(self.val)
@@ -158,9 +153,15 @@ class GiniCallback(Callback):
         pass
 
 
+def NNModelFactory(target, epochs, seed=common.SEED):
+    return lambda: NNModel(target, epochs, seed)
+
+
 class NNModel:
-    def __init__(self, target):
+    def __init__(self, target, epochs=10, seed=common.SEED):
         self.target = target
+        self.epochs = epochs
+        self.seed = seed
 
     @common.log_duration
     def filter_data(self, df):
@@ -172,7 +173,7 @@ class NNModel:
         cols_use = [
                 c for c in df.columns if (not c.startswith('ps_calc_'))
                 and (c not in to_drop)]
-        return df[cols_use].copy()
+        return df[cols_use].copy(deep=False)
 
     @common.log_duration
     def make_model(self, input_size, hidden_units):
@@ -195,47 +196,56 @@ class NNModel:
 
     @common.log_duration
     def fit(self, train, test=None):
-        print(train.columns)
+        tf.set_random_seed(self.seed)
+        np.random.seed(self.seed)
 
         train = self.upsample(train)
 
         train = self.filter_data(train)
-        test = self.filter_data(test)
 
-        train_X = train.drop(self.target, axis=1)
-        train_y = train[self.target]
+        train_X = np.array(train.drop(self.target, axis=1), dtype='float32')
+        train_y = np.array(train[self.target], dtype='float32')
+        del train
 
-        self.model = self.make_model(len(train_X.columns), 35)
+        self.model = self.make_model(train_X.shape[1], 35)
 
         validation_data = None
         if test is not None:
+            test = self.filter_data(test)
             validation_data = (
-                    np.array(test.drop(self.target, axis=1)),
-                    np.array(test[self.target]))
+                    np.array(test.drop(self.target, axis=1), dtype='float32'),
+                    np.array(test[self.target], dtype='float32'))
+            del test
 
         self.model.fit(
-                np.array(train_X),
-                np.array(train_y),
+                train_X,
+                train_y,
                 batch_size=2048,
-                epochs=10,
+                epochs=self.epochs,
                 validation_data=validation_data,
-                callbacks=[GiniCallback(self.target, train, test)])
+                callbacks=[GiniCallback(
+                    self.target, (train_X, train_y), validation_data)])
 
     @common.log_duration
     def predict(self, X):
         X = self.filter_data(X)
         if self.target in X.columns:
             X = X.drop(self.target, axis=1)
-        return self.model.predict(np.array(X), batch_size=2048).reshape([-1])
+        return self.model.predict(
+                np.array(X, dtype='float32'), batch_size=2048).reshape([-1])
 
 
 def MakeModelFactory(target, nn_params):
+    rand = random.Random(common.SEED)
+    factories = [NNModelFactory(
+        target, seed=rand.randint(1, 1000000), **nn_params)
+        for i in range(3)]
     base_model = common.NestedClassifiersFactory([
-        common.AverageClassifierFactory(
-            NNModelFactory(target, **nn_params), 3),
+        common.AverageClassifierFactory(*factories),
     ])
     return common.NestedClassifiersFactory([
         lambda: SpecializedFeatures(target),
+        # lambda: common.FeatureScaler(target),
         lambda: common.CrossValidator(target, base_model),
     ])
 
@@ -251,11 +261,6 @@ def SaveDF(df, path, columns):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-            '--rounds', default=20000, type=int,
-            help='Max number of boosting rounds')
-    parser.add_argument(
-            '--eta', default=0.07, type=float, help='Learning rate')
     parser.add_argument(
             '--full', default=False, action='store_true',
             help='Whether to do full train and evaluate test')
@@ -273,69 +278,51 @@ def main():
 
     logging.info('Reading data...')
     train = gen_features(load_train_data())
-    test = gen_features(load_test_data())
 
     TARGET = 'target'
 
-    nn_params = dict()
+    nn_params = dict(epochs=11)
 
     if args.search:
         params_space = dict(
-            num_leaves=[10, 15, 20, 25, 31],
+            epochs=[10, 11, 12, 13, 14, 15],
         )
 
-        best_score = -1e100
-        best_params = None
-
-        history = []
-
-        param_combinations = product_params(params_space)
-        logging.info(
-                'Search %d param combinations...', len(param_combinations))
-        for params in param_combinations:
+        def ModelFactory(**params):
             params = dict(params)
-            logging.info('-----------------------------------------------')
-            logging.info('Params: %s', params)
             p = dict(nn_params)
             p.update(params)
+            return MakeModelFactory(TARGET, p)()
+        model = common.HyperparamSearch(ModelFactory, params_space)
+        model.fit(train)
 
-            factory = MakeModelFactory(TARGET, p)
-            validator = common.CrossValidator(TARGET, factory)
-            validator.fit(train)
-            score = validator.loss
-
-            logging.info('Score: %f', score)
-            if score > best_score:
-                best_score = score
-                best_params = params
-                logging.info('Best score so far')
-            logging.info('Current best score: %f', best_score)
-            logging.info('Current best params: %s', best_params)
-            history.append((score, params))
-
-        for score, params in sorted(history, key=lambda x: x[0]):
+        for score, params in sorted(model.history, key=lambda x: x[0]):
             logging.info('='*80)
             logging.info('Score: %f', score)
             logging.info('Params: %s', params)
 
-    if args.full:
+    elif args.full:
         factory = MakeModelFactory(TARGET, nn_params)
         logging.info('Training...')
-        validator = factory()
-        validator.fit(train)
-        logging.info('CV Score: %f', validator.loss)
+        model = factory()
+        model.fit(train)
+    else:
+        print('No action requested')
+        return
 
-        logging.info('Evaluating test set...')
-        test_pred = validator.predict(test)
+    logging.info('CV Score: %f', model.loss)
+    logging.info('Evaluating test set...')
+    test = gen_features(load_test_data())
+    test_pred = model.predict(test)
 
-        logging.info('Prediction mean: %f', test_pred.mean())
-        logging.info('Train mean: %f', train[TARGET].mean())
+    logging.info('Prediction mean: %f', test_pred.mean())
+    logging.info('Train mean: %f', train[TARGET].mean())
 
-        test[TARGET] = test_pred
-        train[TARGET] = validator.train_preds
+    test[TARGET] = test_pred
+    train[TARGET] = model.train_preds
 
-        common.SaveDF(test, 'solution-nn.csv.gz', columns=[TARGET])
-        common.SaveDF(train, 'train-nn.csv.gz', columns=[TARGET])
+    common.SaveDF(test, 'solution-nn.csv.gz', columns=[TARGET])
+    common.SaveDF(train, 'train-nn.csv.gz', columns=[TARGET])
 
 
 if __name__ == '__main__':

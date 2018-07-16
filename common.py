@@ -1,13 +1,15 @@
-import numpy as np
-import time
-import logging
+import gc
 import lightgbm as lgb
+import logging
+import numpy as np
 import pandas as pd
+import random
+import time
 
 from numba import jit
 from sklearn.model_selection import StratifiedKFold
 
-SEED = 265359275
+SEED = 8797987
 
 FOLDS = 5
 
@@ -269,8 +271,8 @@ class CrossValidator:
         select = StratifiedKFold(self.folds, shuffle=True, random_state=SEED)
         train_preds = np.zeros(len(train))
         for train_index, test_index in select.split(train, train[self.target]):
-            sub_train = train.iloc[train_index].copy()
-            sub_val = train.iloc[test_index].copy()
+            sub_train = train.iloc[train_index].copy(deep=False)
+            sub_val = train.iloc[test_index].copy(deep=False)
 
             model = self.model_factory()
             model.fit(sub_train, sub_val)
@@ -283,6 +285,7 @@ class CrossValidator:
             models.append(model)
 
             logging.info('Fold CV: %f, Running CV mean: %f', cv, np.mean(loss))
+            gc.collect()
         self.models = models
         self.loss = np.mean(loss)
         self.train_preds = train_preds
@@ -324,23 +327,21 @@ class HCCEncoder:
 
 
 class AverageClassifierFactory:
-    def __init__(self, base_model_factory, runs):
-        self.factory = base_model_factory
-        self.runs = runs
+    def __init__(self, *factories):
+        self.factories = factories
 
     def __call__(self):
-        return AverageClassifier(self.factory, self.runs)
+        return AverageClassifier(self.factories)
 
 
 class AverageClassifier:
-    def __init__(self, base_model_factory, runs):
-        self.factory = base_model_factory
-        self.runs = runs
+    def __init__(self, factories):
+        self.factories = factories
 
     def fit(self, train, val):
         models = []
-        for i in range(self.runs):
-            model = self.factory()
+        for factory in self.factories:
+            model = factory()
             model.fit(train, val)
             models.append(model)
 
@@ -391,3 +392,142 @@ class Upsampler:
     @property
     def train_preds(self):
         return self.base_model.train_preds
+
+
+class FeatureScaler:
+    def __init__(self, target):
+        self.target = target
+
+    @log_duration
+    def fit(self, train, validation=None):
+        minmax = {}
+        for feature in train.columns:
+            if feature == self.target:
+                continue
+            col = train[feature]
+            minmax[feature] = (col.min(), col.max())
+        self.minmax = minmax
+
+    @log_duration
+    def predict(self, X):
+        X = X.copy(deep=False)
+        for (feature, (minimum, maximum)) in self.minmax.items():
+            ratio = float(maximum - minimum)
+            if ratio < 0.00001 or ratio == 1:
+                continue
+            X[feature] = (
+                    X[feature].astype('float32') - minimum) * (2.0/ratio) - 1
+        return X
+
+
+def AveragerFactory(target, weights):
+    return lambda: Averager(target, weights)
+
+
+class Averager:
+    def __init__(self, target, weights):
+        self.target = target
+        self.weights = weights
+
+    def fit(self, train, validation):
+        self.features = [f for f in train.columns if f != self.target]
+        assert len(self.features) == len(self.weights)
+
+    @log_duration
+    def predict(self, X):
+        W = sum(self.weights)
+        return sum([X[f]*w for f, w in zip(self.features, self.weights)]) / W
+
+
+def AveragerRankFactory(target, weights):
+    return lambda: AveragerRank(target, weights)
+
+
+class AveragerRank:
+    def __init__(self, target, weights):
+        self.target = target
+        self.weights = weights
+
+    def fit(self, train, validation):
+        self.features = [f for f in train.columns if f != self.target]
+        assert len(self.features) == len(self.weights)
+
+    @log_duration
+    def predict(self, X):
+        W = sum(self.weights)
+        values = []
+        for f, w in zip(self.features, self.weights):
+            ranked = np.argsort(np.argsort(X[f]))
+            ranked = ranked * (w / len(X))
+            values.append(ranked)
+        return sum(values) / W
+
+
+def product_params_rec(keys, args, acc):
+    if not keys:
+        yield dict(acc)
+        return None
+    for v in args[keys[0]]:
+        acc[keys[0]] = v
+        yield from product_params_rec(keys[1:], args, acc)
+        del acc[keys[0]]
+
+
+def product_params(args):
+    keys = sorted(list(args.keys()))
+    output = list(product_params_rec(keys, args, {}))
+    r = random.SystemRandom()
+    r.shuffle(output)
+    return output
+
+
+class HyperparamSearch:
+    def __init__(self, factory, params_space):
+        self.factory = factory
+        self.params_space = params_space
+
+    def fit(self, train, val=None):
+
+        best_score = -1e100
+        best_params = None
+        best_model = None
+
+        history = []
+
+        param_combinations = product_params(self.params_space)
+        logging.info(
+                'Search %d param combinations...', len(param_combinations))
+        for params in param_combinations:
+            params = dict(params)
+            logging.info('-----------------------------------------------')
+            logging.info('Params: %s', params)
+
+            model = self.factory(**params)
+
+            model.fit(train, val)
+            score = model.loss
+
+            logging.info('Score: %f', score)
+            if score > best_score:
+                best_score = score
+                best_params = params
+                best_model = model
+                logging.info('Best score so far')
+            logging.info('Current best score: %f', best_score)
+            logging.info('Current best params: %s', best_params)
+            history.append((score, params))
+
+        self.history = history
+
+        self.best_model = best_model
+
+    def predict(self, X):
+        return self.best_model.predict(X)
+
+    @property
+    def loss(self):
+        return self.best_model.loss
+
+    @property
+    def train_preds(self):
+        return self.best_model.train_preds

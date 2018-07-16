@@ -22,40 +22,6 @@ def gen_features(df):
     return df
 
 
-@common.log_duration
-def binarize_feature(train, test, column):
-    data = train[column].append(test[column])
-
-    grouped = data.groupby(data).size()
-
-    grouped = grouped[grouped >= 5]
-
-    f = grouped.to_dict()
-
-    tmp = data.apply(lambda x: f.get(x, None) and x)
-    d = pd.get_dummies(tmp, prefix=column)
-
-    train = train.join(d)
-    test = test.join(d)
-
-    feat_names = d.columns.tolist()
-
-    return train, test, feat_names
-
-
-@common.log_duration
-def single_out(train_df, test_df, variable):
-    data = train_df[variable].append(test_df[variable])
-    grouped = data.groupby(data).agg(['size'])
-
-    train_df.loc[
-            train_df.join(grouped, on=variable)['size'] <= 1, variable] = -1
-    test_df.loc[
-            test_df.join(grouped, on=variable)['size'] <= 1, variable] = -1
-
-    return train_df, test_df
-
-
 class SpecializedFeatures:
     def __init__(self, target):
         self.target = target
@@ -118,24 +84,6 @@ def load_test_data():
     return df
 
 
-def product_params_rec(keys, args, acc):
-    if not keys:
-        yield dict(acc)
-        return None
-    for v in args[keys[0]]:
-        acc[keys[0]] = v
-        yield from product_params_rec(keys[1:], args, acc)
-        del acc[keys[0]]
-
-
-def product_params(args):
-    keys = sorted(list(args.keys()))
-    output = list(product_params_rec(keys, args, {}))
-    r = random.SystemRandom()
-    r.shuffle(output)
-    return output
-
-
 def MakeModelFactory(target, lgbm_params):
     return lambda: common.CrossValidator(
             target,
@@ -170,7 +118,6 @@ def main():
 
     logging.info('Reading data...')
     train = gen_features(load_train_data())
-    test = gen_features(load_test_data())
 
     feats = [
       "ps_car_13",
@@ -212,10 +159,6 @@ def main():
     TARGET = 'target'
 
     train = train[feats + [TARGET]]
-    test = test[feats]
-
-    # train, test, f = preCVFeatures(train, test)
-    # feats.extend(f)
 
     param_dict1 = dict(
             num_rounds=args.rounds,
@@ -256,71 +199,44 @@ def main():
             num_rounds=[700, 750, 650],
         )
 
-        best_score = -1e100
-        best_params = None
-        best_model = None
-
-        history = []
-
-        param_combinations = product_params(params_space)
-        logging.info(
-                'Search %d param combinations...', len(param_combinations))
-        for params in param_combinations:
+        def ModelFactory(**params):
             params = dict(params)
-            logging.info('-----------------------------------------------')
-            logging.info('Params: %s', params)
             p = dict(param_dicts[0])
             p.update(params)
+            return MakeModelFactory(TARGET, p)()
+        model = common.HyperparamSearch(ModelFactory, params_space)
+        model.fit(train)
 
-            factory = MakeModelFactory(TARGET, p)
-            validator = factory()
-            validator.fit(train)
-            score = validator.loss
-
-            logging.info('Score: %f', score)
-            if score > best_score:
-                best_score = score
-                best_params = params
-                best_model = validator
-                logging.info('Best score so far')
-            logging.info('Current best score: %f', best_score)
-            logging.info('Current best params: %s', best_params)
-            history.append((score, params))
-
-        for score, params in sorted(history, key=lambda x: x[0]):
+        for score, params in sorted(model.history, key=lambda x: x[0]):
             logging.info('='*80)
             logging.info('Score: %f', score)
             logging.info('Params: %s', params)
 
-        test_pred = best_model.predict(test)
-
-        logging.info('Prediction mean: %f', test_pred.mean())
-        logging.info('Train mean: %f', train[TARGET].mean())
-
-        test[TARGET] = test_pred
-        train[TARGET] = validator.train_preds
-
-        common.SaveDF(test, 'solution-lgbm.csv.gz', columns=[TARGET])
-        common.SaveDF(train, 'train-lgbm.csv.gz', columns=[TARGET])
-
-    if args.full:
+    elif args.full:
         factory = MakeModelFactory(TARGET, *param_dicts)
         logging.info('Training...')
-        validator = factory()
-        validator.fit(train)
-        logging.info('CV Score: %f', validator.loss)
+        model = factory()
+        model.fit(train)
+        logging.info('CV Score: %f', model.loss)
+    else:
+        print('No action requested')
+        return
 
-        logging.info('Evaluating test set...')
-        test_pred = validator.predict(test)
+    logging.info('Evaluating test set...')
 
-        logging.info('Prediction mean: %f', test_pred.mean())
-        logging.info('Train mean: %f', train[TARGET].mean())
+    test = gen_features(load_test_data())
+    test = test[feats]
 
-        test[TARGET] = test_pred
-        train[TARGET] = validator.train_preds
+    test_pred = model.predict(test)
 
-        common.SaveDF(test, 'solution-lgbm.csv.gz', columns=[TARGET])
-        common.SaveDF(train, 'train-lgbm.csv.gz', columns=[TARGET])
+    logging.info('Prediction mean: %f', test_pred.mean())
+    logging.info('Train mean: %f', train[TARGET].mean())
+
+    test[TARGET] = test_pred
+    train[TARGET] = model.train_preds
+
+    common.SaveDF(test, 'solution-lgbm.csv.gz', columns=[TARGET])
+    common.SaveDF(train, 'train-lgbm.csv.gz', columns=[TARGET])
 
 
 if __name__ == '__main__':
